@@ -17,6 +17,7 @@ package com.github.benmanes.caffeine.cache;
 
 import java.util.Arrays;
 import java.util.Random;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.Function;
@@ -40,33 +41,23 @@ import com.yahoo.ycsb.generator.ScrambledZipfianGenerator;
  */
 @State(Scope.Benchmark)
 public class ComputeBenchmark {
-  static final int SIZE = (2 << 14);
-  static final int MASK = SIZE - 1;
-  static final int ITEMS = SIZE / 3;
-  static final Integer COMPUTE_KEY = SIZE / 2;
+  static final int CAPACITY = 1024 * 1024;
   static final Mapper<Integer, Boolean> mapper = any -> Boolean.TRUE;
   static final Function<Integer, Boolean> mappingFunction = any -> Boolean.TRUE;
   static final CacheLoader<Integer, Boolean> cacheLoader = CacheLoader.from(key -> Boolean.TRUE);
 
-  @Param({"ConcurrentHashMap", "Caffeine", "Guava", "Rapidoid"})
+  @Param({"Caffeine", "Guava"})
   String computeType;
 
   Function<Integer, Boolean> benchmarkFunction;
-  Integer[] ints;
+
+  Cache<Integer, Boolean> caffeineCache;
 
   @State(Scope.Thread)
   public static class ThreadState {
-    static final Random random = new Random();
-    int index = random.nextInt();
+    final Random random = new Random();
   }
 
-  public ComputeBenchmark() {
-    ints = new Integer[SIZE];
-    NumberGenerator generator = new ScrambledZipfianGenerator(ITEMS);
-    for (int i = 0; i < SIZE; i++) {
-      ints[i] = generator.nextValue().intValue();
-    }
-  }
 
   @Setup
   public void setup() {
@@ -81,17 +72,16 @@ public class ComputeBenchmark {
     } else {
       throw new AssertionError("Unknown computingType: " + computeType);
     }
-    Arrays.stream(ints).forEach(benchmarkFunction::apply);
   }
 
-  @Benchmark @Threads(32)
-  public Boolean compute_sameKey(ThreadState threadState) {
-    return benchmarkFunction.apply(COMPUTE_KEY);
-  }
-
-  @Benchmark @Threads(32)
+  @Benchmark @Threads(80)
   public Boolean compute_spread(ThreadState threadState) {
-    return benchmarkFunction.apply(ints[threadState.index++ & MASK]);
+    // Generate a key between 0 and 1<22, but heavily skewed towards lower keys.
+    // With capacity = 1M, this yields a ~95% hit ratio.
+    Random r = threadState.random;
+    int log = r.nextInt(22);
+    int key = r.nextInt(1 << log);
+    return benchmarkFunction.apply(key);
   }
 
   private void setupConcurrentHashMap() {
@@ -100,13 +90,17 @@ public class ComputeBenchmark {
   }
 
   private void setupCaffeine() {
-    Cache<Integer, Boolean> cache = Caffeine.newBuilder().build();
-    benchmarkFunction = key -> cache.get(key, mappingFunction);
+    caffeineCache = Caffeine.newBuilder()
+        .maximumSize(CAPACITY)
+        .build();
+    benchmarkFunction = key -> caffeineCache.get(key, mappingFunction);
   }
 
   private void setupGuava() {
     com.google.common.cache.LoadingCache<Integer, Boolean> cache =
-        CacheBuilder.newBuilder().concurrencyLevel(64).build(cacheLoader);
+        CacheBuilder.newBuilder().concurrencyLevel(64)
+        .maximumSize(CAPACITY)
+        .build(cacheLoader);
     benchmarkFunction = cache::getUnchecked;
   }
 
